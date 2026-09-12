@@ -1,0 +1,11 @@
+# Secrets — never commit
+secrets_local.py
+
+# Runtime state (auto-generated)
+seen.json
+price_scan.json
+fare_watcher.log
+
+# Python
+__pycache__/
+*.pyc
