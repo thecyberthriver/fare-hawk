@@ -127,6 +127,12 @@ LLM_SYSTEM = "You are a flight-deal analyst. Reply with ONLY compact JSON, no pr
 OLLAMA_MIN_SCORE = 40          # WIDE-NET: 40 lets strong deals through, not just glitches (raise to be pickier)
 OLLAMA_MAX_SCORED = 15         # cap items scored per run so a burst can't stall it
 
+# Hard cap on alerts sent per run. Without AI scoring (no ANTHROPIC_API_KEY) the
+# agent ranks deals with a free keyword heuristic and sends the strongest few;
+# any overflow is DEFERRED (un-marked as seen) so it resurfaces on the next run
+# rather than flooding your chat or being lost. Also protects the AI path.
+MAX_ALERTS_PER_RUN = 6
+
 # --- Below-value price scan (independent of the feeds) ---------------------
 # Queries a flight-price API for each route on the watchlist and flags fares
 # priced well below the route's typical price. Pick ONE provider (USE_* flag).
@@ -320,12 +326,37 @@ def score_fare(item: dict) -> dict | None:
         return None
 
 
+# Keyword heuristics for the no-API path — free stand-in for LLM scoring so the
+# strongest-signal deals rank first (main() then caps how many send per run).
+_ERROR_TERMS = ("error fare", "mistake fare", "glitch", "pricing error",
+                "fare error", "wow fare", "insane")
+_DEAL_TERMS = ("deal", "cheap", "under $", "% off", " sale ", "roundtrip",
+               "round-trip", "nonstop", "non-stop", "business class", "first class")
+
+
+def _heuristic_score(item: dict) -> int:
+    """Rough deal-strength score from title/summary keywords + price cues.
+    No LLM, no cost — used when ANTHROPIC_API_KEY isn't set."""
+    blob = f"{item.get('title', '')} {item.get('summary', '')}".lower()
+    score = sum(40 for t in _ERROR_TERMS if t in blob)
+    score += sum(8 for t in _DEAL_TERMS if t in blob)
+    prices = re.findall(r"\$\s?(\d{2,4})", blob)
+    if prices:
+        lo = min(int(p) for p in prices)
+        score += 10 + (25 if lo <= 99 else 12 if lo <= 299 else 0)
+    return score
+
+
 def rank_candidates(candidates: list[dict]) -> list[dict]:
-    """Attach an Ollama score to each candidate, drop those below the
-    threshold, and return them sorted best-first. Unscored items (Ollama down)
-    are kept and treated as top priority so real alerts are never lost."""
-    if not USE_LLM or not ANTHROPIC_API_KEY or not candidates:
+    """Rank candidates best-first. With ANTHROPIC_API_KEY set, uses Claude to
+    score and drop weak matches; without it, falls back to a free keyword
+    heuristic. main() caps how many actually send per run."""
+    if not candidates:
         return candidates
+    if not USE_LLM or not ANTHROPIC_API_KEY:
+        for it in candidates:
+            it["_rank"] = _heuristic_score(it)
+        return sorted(candidates, key=lambda it: it.get("_rank", 0), reverse=True)
 
     scored = 0
     for item in candidates:
@@ -474,12 +505,22 @@ def main() -> int:
         seen.append(hit["id"])
         candidates.append(hit)
 
-    # Phase 2: rank with the local model (drops weak matches, sorts best-first).
+    # Phase 2: rank (Claude if available, else free keyword heuristic), best-first.
     ranked = rank_candidates(candidates)
+
+    # Cap alerts per run so a burst (e.g. an empty-cache first run) can't flood.
+    # Overflow is DEFERRED: un-mark it as seen so it comes back next run and the
+    # backlog drains a few at a time — nothing is lost.
+    to_send = ranked[:MAX_ALERTS_PER_RUN]
+    deferred = ranked[MAX_ALERTS_PER_RUN:]
+    if deferred:
+        defer_ids = {it["id"] for it in deferred}
+        seen = [u for u in seen if u not in defer_ids]
+        log(f"Deferring {len(deferred)} deal(s) past the per-run cap of {MAX_ALERTS_PER_RUN}.")
 
     # Phase 3: alert, best deal first.
     new_alerts = 0
-    for item in ranked:
+    for item in to_send:
         if send_push(item):
             new_alerts += 1
             badge = f"{item['_ollama']['score']}/100 " if item.get("_ollama") else ""
