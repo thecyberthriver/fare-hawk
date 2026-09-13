@@ -1,0 +1,47 @@
+name: Fare Watcher
+
+# Runs the fare watcher in GitHub's cloud so it fires without your PC on.
+# NOTE: GitHub schedules are best-effort and the shortest interval is 5 min;
+# under load, scheduled runs can be delayed or skipped. For time-critical error
+# fares, running locally (Task Scheduler) is more punctual.
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fare-watcher
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    environment: production   # gates env-scoped secrets to the default branch
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+
+      # Persist de-dupe + price-scan state across the ephemeral runners.
+      - name: Restore state cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        with:
+          path: |
+            seen.json
+            price_scan.json
+          key: fw-state-${{ github.run_id }}
+          restore-keys: |
+            fw-state-
+
+      - name: Run fare watcher
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          SERPAPI_KEY: ${{ secrets.SERPAPI_KEY }}
+        run: python fare_watcher.py

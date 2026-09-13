@@ -14,6 +14,7 @@ Stateless between runs except for seen.json (the de-dupe cache).
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 import html
@@ -32,8 +33,9 @@ import feedparser
 #   1. Message @BotFather -> /newbot -> copy the bot TOKEN.
 #   2. Message your new bot once (say "hi"), then run: python fare_watcher.py --chatid
 #      to auto-print your chat id. Paste it below.
-TELEGRAM_BOT_TOKEN = "CHANGE-ME:paste-token-from-BotFather"   # overridden by secrets_local.py
-TELEGRAM_CHAT_ID = "CHANGE-ME-chat-id"                        # overridden by secrets_local.py
+# Env vars (GitHub Actions Secrets) win; secrets_local.py fills gaps locally.
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "CHANGE-ME:paste-token-from-BotFather")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "CHANGE-ME-chat-id")
 
 # Your departure airports / cities. Case-insensitive substring match against the
 # deal's title + summary. Include IATA codes AND city names for good coverage.
@@ -114,11 +116,15 @@ MAX_SEEN = 800  # trim cache to this many most-recent IDs
 # Alerts below OLLAMA_MIN_SCORE are dropped; the rest are sent best-first with
 # the score + one-line reason attached. If Ollama is unreachable, the agent
 # degrades gracefully: it sends the alert unscored rather than losing it.
-USE_OLLAMA = True
-OLLAMA_URL = "http://localhost:11434/api/generate"
-OLLAMA_MODEL = "phi3"          # installed locally; fast + good enough for scoring
+# Scoring uses the Anthropic API (Claude Haiku) when ANTHROPIC_API_KEY is set —
+# a GitHub repo Secret in the cloud. If the key is absent the agent degrades
+# gracefully: it sends alerts UNSCORED rather than losing them.
+USE_LLM = True
+CLAUDE_MODEL = "claude-haiku-4-5"
+CLAUDE_TIMEOUT = 30
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+LLM_SYSTEM = "You are a flight-deal analyst. Reply with ONLY compact JSON, no prose."
 OLLAMA_MIN_SCORE = 40          # WIDE-NET: 40 lets strong deals through, not just glitches (raise to be pickier)
-OLLAMA_TIMEOUT = 120           # seconds per scoring call (first call loads model)
 OLLAMA_MAX_SCORED = 15         # cap items scored per run so a burst can't stall it
 
 # --- Below-value price scan (independent of the feeds) ---------------------
@@ -161,15 +167,20 @@ PRICE_ROUTES = [
 # Price provider: SerpApi Google Flights (instant key, no approval).
 # Get a key at https://serpapi.com/ and put it in secrets_local.py, then set USE_SERPAPI=True.
 USE_SERPAPI = True
-SERPAPI_KEY = "CHANGE-ME-serpapi-key"                        # overridden by secrets_local.py
+SERPAPI_KEY = os.environ.get("SERPAPI_KEY", "CHANGE-ME-serpapi-key")   # overridden by secrets_local.py
 
 # Load real credentials from an untracked local file (keeps secrets out of git).
 # Create secrets_local.py with TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID / SERPAPI_KEY.
 try:
     import secrets_local as _secrets
-    TELEGRAM_BOT_TOKEN = getattr(_secrets, "TELEGRAM_BOT_TOKEN", TELEGRAM_BOT_TOKEN)
-    TELEGRAM_CHAT_ID = getattr(_secrets, "TELEGRAM_CHAT_ID", TELEGRAM_CHAT_ID)
-    SERPAPI_KEY = getattr(_secrets, "SERPAPI_KEY", SERPAPI_KEY)
+    if "CHANGE-ME" in TELEGRAM_BOT_TOKEN:
+        TELEGRAM_BOT_TOKEN = getattr(_secrets, "TELEGRAM_BOT_TOKEN", TELEGRAM_BOT_TOKEN)
+    if "CHANGE-ME" in TELEGRAM_CHAT_ID:
+        TELEGRAM_CHAT_ID = getattr(_secrets, "TELEGRAM_CHAT_ID", TELEGRAM_CHAT_ID)
+    if "CHANGE-ME" in SERPAPI_KEY:
+        SERPAPI_KEY = getattr(_secrets, "SERPAPI_KEY", SERPAPI_KEY)
+    if not ANTHROPIC_API_KEY:
+        ANTHROPIC_API_KEY = getattr(_secrets, "ANTHROPIC_API_KEY", "")
 except ImportError:
     pass  # no local secrets file — placeholders stay (edit them or add secrets_local.py)
 
@@ -285,21 +296,19 @@ def collect_all() -> list[dict]:
 def score_fare(item: dict) -> dict | None:
     """Score a candidate via the local model. Returns {score,verdict,reason}
     or None if scoring failed (caller should then send the alert unscored)."""
+    if not ANTHROPIC_API_KEY:
+        return None
     prompt = OLLAMA_PROMPT.format(title=item["title"], text=item["summary"][:500])
     try:
-        r = requests.post(
-            OLLAMA_URL,
-            json={
-                "model": OLLAMA_MODEL,
-                "prompt": prompt,
-                "stream": False,
-                "format": "json",
-                "options": {"temperature": 0.1, "num_predict": 80},
-            },
-            timeout=OLLAMA_TIMEOUT,
+        import anthropic
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=CLAUDE_TIMEOUT)
+        resp = client.messages.create(
+            model=CLAUDE_MODEL, max_tokens=120, system=LLM_SYSTEM,
+            messages=[{"role": "user", "content": prompt}],
         )
-        r.raise_for_status()
-        data = json.loads(r.json()["response"])
+        txt = "".join(b.text for b in resp.content if b.type == "text").strip()
+        js, je = txt.find("{"), txt.rfind("}")
+        data = json.loads(txt[js:je + 1])
         score = int(data.get("score", 0))
         return {
             "score": max(0, min(100, score)),
@@ -307,7 +316,7 @@ def score_fare(item: dict) -> dict | None:
             "reason": str(data.get("reason", "")).strip(),
         }
     except Exception as e:  # noqa: BLE001 - network/JSON/parse errors
-        log(f"WARN ollama scoring failed for {item['url']}: {e}")
+        log(f"WARN claude scoring failed for {item['url']}: {e}")
         return None
 
 
@@ -315,7 +324,7 @@ def rank_candidates(candidates: list[dict]) -> list[dict]:
     """Attach an Ollama score to each candidate, drop those below the
     threshold, and return them sorted best-first. Unscored items (Ollama down)
     are kept and treated as top priority so real alerts are never lost."""
-    if not USE_OLLAMA or not candidates:
+    if not USE_LLM or not ANTHROPIC_API_KEY or not candidates:
         return candidates
 
     scored = 0
@@ -441,7 +450,7 @@ def main() -> int:
     # route-qualified, so they skip the keyword filter but still get de-duped,
     # ranked, and alerted like everything else. Never let it break a run.
     price_hits = []
-    if USE_SERPAPI and _price_scan_due():
+    if USE_SERPAPI and "CHANGE-ME" not in SERPAPI_KEY and _price_scan_due():
         _mark_price_scan()  # stamp first so a crash mid-scan can't re-spend quota
         # Rotate the route list by day so both trip types fit the daily quota
         # while every route still gets covered within a couple of days.
